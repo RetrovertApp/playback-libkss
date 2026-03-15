@@ -1,0 +1,11 @@
+--- a/src/kssplay.c
++++ b/src/kssplay.c
+@@ -684,7 +684,7 @@
+     OPLL_setPatch(kssplay->vm->opll, data);
+ }
+
+-void KSSPLAY_set_channel_mask(KSSPLAY *kssplay, uint32_t device, uint32_t mask) {
++void KSSPLAY_set_channel_mask(KSSPLAY *kssplay, KSS_DEVICE device, uint32_t mask) {
+   switch (device) {
+   case KSS_DEVICE_PSG:
+     if (kssplay->vm->psg) {
