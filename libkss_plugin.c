@@ -248,7 +248,8 @@ static RVReadInfo libkss_plugin_read_data(void* user_data, RVReadData dest) {
     }
 
     // Calculate how many S16 stereo frames fit in the output buffer
-    uint32_t max_frames = dest.channels_output_max_bytes_size / (sizeof(int16_t) * 2);
+    uint32_t capacity_frames = dest.channels_output_max_bytes_size / (sizeof(int16_t) * 2);
+    uint32_t max_frames = dest.info.frame_count < capacity_frames ? dest.info.frame_count : capacity_frames;
 
     // Generate stereo S16 directly to output buffer
     KSSPLAY_calc(data->kssplay, (int16_t*)dest.channels_output, max_frames);
