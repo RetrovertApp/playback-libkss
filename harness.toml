@@ -1,0 +1,9 @@
+[plugin]
+name = "libkss"
+
+[data]
+entries = []
+
+[[fixtures]]
+file = "fixtures/retrovert_selftest.kss"
+sha256 = "414801fb954aacb4b6712e09f4b9a0a85683cd01b0fcca430b1870c4e404ca4b"
