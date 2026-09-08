@@ -21,6 +21,8 @@
 #include "kss.h"
 #include "kssplay.h"
 
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,6 +35,13 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define OUTPUT_SAMPLE_RATE 48000
+
+// PSG/SNG 4 + SCC 5 + OPLL 14 + OPL 9 is the widest set a KSS file can present.
+#define LIBKSS_MAX_SCOPE_CHANNELS 32
+// Per-channel scope history, as a ring. Power of two: the index wraps with a mask.
+#define LIBKSS_SCOPE_WINDOW 2048
+// Window the VU peak is taken over.
+#define LIBKSS_VU_WINDOW 512
 // Default song length when duration is unknown (3 minutes)
 #define DEFAULT_LENGTH_MS (3 * 60 * 1000)
 // Fade out duration in ms
@@ -44,12 +53,25 @@ RV_PLUGIN_USE_METADATA_API();
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// One scope channel: where the chip emulation leaves this channel's most recent
+// sample, plus the name the host shows. The pointers are into the chip structs
+// owned by the KSSPLAY's VM, so they stay valid until the song is closed.
+typedef struct LibkssScopeChannel {
+    const int16_t* source;
+    char name[24];
+} LibkssScopeChannel;
+
 typedef struct LibkssReplayerData {
     KSS* kss;
     KSSPLAY* kssplay;
     int current_track;
     int elapsed_frames;
     int max_frames;
+    LibkssScopeChannel scope_channels[LIBKSS_MAX_SCOPE_CHANNELS];
+    uint32_t scope_count;
+    bool scope_enabled;
+    float scope_ring[LIBKSS_MAX_SCOPE_CHANNELS * LIBKSS_SCOPE_WINDOW];
+    uint32_t scope_pos;
 } LibkssReplayerData;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -84,6 +106,80 @@ static int libkss_plugin_destroy(void* user_data) {
 
     free(data);
     return 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Build the scope channel map for the song that was just reset.
+//
+// Which chips a KSS file drives is decided by its header, and KSSPLAY only runs
+// the ones it names -- so the map mirrors the same conditions the mixer uses.
+// Each entry points straight at the slot the chip emulation writes its latest
+// channel sample into; the mixer updates those as a side effect of rendering,
+// so no second pass over the audio is needed.
+
+static void libkss_add_scope_channel(LibkssReplayerData* data, const int16_t* source, const char* name) {
+    if (data->scope_count >= LIBKSS_MAX_SCOPE_CHANNELS || source == nullptr) {
+        return;
+    }
+    LibkssScopeChannel* channel = &data->scope_channels[data->scope_count++];
+    channel->source = source;
+    snprintf(channel->name, sizeof(channel->name), "%s", name);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void libkss_build_scope_channels(LibkssReplayerData* data) {
+    data->scope_count = 0;
+    data->scope_pos = 0;
+    memset(data->scope_ring, 0, sizeof(data->scope_ring));
+
+    VM* vm = data->kssplay != nullptr ? data->kssplay->vm : nullptr;
+    if (vm == nullptr) {
+        return;
+    }
+
+    char name[24];
+
+    if (data->kss->sn76489) {
+        if (vm->sng != nullptr) {
+            for (int i = 0; i < 3; i++) {
+                snprintf(name, sizeof(name), "SN %d", i + 1);
+                libkss_add_scope_channel(data, &vm->sng->ch_out[i], name);
+            }
+            libkss_add_scope_channel(data, &vm->sng->ch_out[3], "SN Noise");
+        }
+    } else if (vm->psg != nullptr) {
+        static const char* s_psg[3] = { "PSG A", "PSG B", "PSG C" };
+        for (int i = 0; i < 3; i++) {
+            libkss_add_scope_channel(data, &vm->psg->ch_out[i], s_psg[i]);
+        }
+    }
+
+    if (vm->scc != nullptr) {
+        for (int i = 0; i < 5; i++) {
+            snprintf(name, sizeof(name), "SCC %d", i + 1);
+            libkss_add_scope_channel(data, &vm->scc->ch_out[i], name);
+        }
+    }
+
+    if (data->kss->fmpac && vm->opll != nullptr) {
+        for (int i = 0; i < 9; i++) {
+            snprintf(name, sizeof(name), "FM %d", i + 1);
+            libkss_add_scope_channel(data, &vm->opll->ch_out[i], name);
+        }
+        // The five rhythm voices share FM channels 7-9 when rhythm mode is on.
+        static const char* s_rhythm[5] = { "Bass Drum", "Hi-Hat", "Snare", "Tom", "Cymbal" };
+        for (int i = 0; i < 5; i++) {
+            libkss_add_scope_channel(data, &vm->opll->ch_out[9 + i], s_rhythm[i]);
+        }
+    }
+
+    if (data->kss->msx_audio && vm->opl != nullptr) {
+        for (int i = 0; i < 9; i++) {
+            snprintf(name, sizeof(name), "OPL %d", i + 1);
+            libkss_add_scope_channel(data, &vm->opl->ch_out[i], name);
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -148,6 +244,8 @@ static int libkss_plugin_open(void* user_data, const char* url, uint32_t subsong
     data->current_track = track;
 
     KSSPLAY_reset(data->kssplay, (uint32_t)track, 0);
+
+    libkss_build_scope_channels(data);
 
     // Set up silence detection (5 seconds)
     KSSPLAY_set_silent_limit(data->kssplay, 5000);
@@ -251,8 +349,25 @@ static RVReadInfo libkss_plugin_read_data(void* user_data, RVReadData dest) {
     uint32_t capacity_frames = dest.channels_output_max_bytes_size / (sizeof(int16_t) * 2);
     uint32_t max_frames = dest.info.frame_count < capacity_frames ? dest.info.frame_count : capacity_frames;
 
-    // Generate stereo S16 directly to output buffer
-    KSSPLAY_calc(data->kssplay, (int16_t*)dest.channels_output, max_frames);
+    if (data->scope_enabled && data->scope_count > 0) {
+        // KSSPLAY_calc is a per-sample loop whose only per-call work is reading
+        // the device volumes, so rendering a sample at a time produces the same
+        // audio and lets the chips' per-channel outputs be sampled in step.
+        int16_t* output = (int16_t*)dest.channels_output;
+        uint32_t pos = data->scope_pos;
+        for (uint32_t frame = 0; frame < max_frames; frame++) {
+            KSSPLAY_calc(data->kssplay, output + (size_t)frame * 2, 1);
+            for (uint32_t c = 0; c < data->scope_count; c++) {
+                data->scope_ring[c * LIBKSS_SCOPE_WINDOW + pos]
+                    = (float)*data->scope_channels[c].source * (1.0f / 32768.0f);
+            }
+            pos = (pos + 1) & (LIBKSS_SCOPE_WINDOW - 1);
+        }
+        data->scope_pos = pos;
+    } else {
+        // Generate stereo S16 directly to output buffer
+        KSSPLAY_calc(data->kssplay, (int16_t*)dest.channels_output, max_frames);
+    }
 
     data->elapsed_frames += (int)max_frames;
 
@@ -366,6 +481,111 @@ static void libkss_plugin_static_init(const RVService* service_api) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Visualization.
+//
+// The scope is the chip emulation's own per-channel output, sampled in step with
+// the mix -- see libkss_build_scope_channels. Capture costs a per-sample render
+// loop, so it only runs while the host has the scope switched on.
+
+static bool libkss_plugin_get_structure(void* user_data, RVVizInfo* out) {
+    LibkssReplayerData* data = (LibkssReplayerData*)user_data;
+    if (data == nullptr || out == nullptr || data->scope_count == 0) {
+        return false;
+    }
+
+    out->caps = RVVizCaps_Scope | RVVizCaps_Vu;
+    out->scroll_mode = RVScrollMode_Synchronized;
+    out->pattern_channel_count = 0;
+    out->scope_channel_count = data->scope_count;
+    out->column_count = 0;
+    return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t libkss_plugin_get_scope_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    LibkssReplayerData* data = (LibkssReplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return 0;
+    }
+
+    uint32_t count = data->scope_count < cap ? data->scope_count : cap;
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        snprintf((char*)out[i].name, sizeof(out[i].name), "%s", data->scope_channels[i].name);
+        out[i].scope_width = 1;
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void libkss_plugin_set_scope_enabled(void* user_data, bool on) {
+    LibkssReplayerData* data = (LibkssReplayerData*)user_data;
+    if (data == nullptr) {
+        return;
+    }
+
+    if (on && !data->scope_enabled) {
+        memset(data->scope_ring, 0, sizeof(data->scope_ring));
+    }
+    data->scope_enabled = on;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t libkss_plugin_get_scope_samples(void* user_data, int32_t channel, float* out, uint32_t cap) {
+    LibkssReplayerData* data = (LibkssReplayerData*)user_data;
+    if (data == nullptr || out == nullptr || !data->scope_enabled) {
+        return 0;
+    }
+    if (channel < 0 || (uint32_t)channel >= data->scope_count) {
+        return 0;
+    }
+
+    uint32_t count = cap < LIBKSS_SCOPE_WINDOW ? cap : LIBKSS_SCOPE_WINDOW;
+    const float* ring = &data->scope_ring[(uint32_t)channel * LIBKSS_SCOPE_WINDOW];
+    uint32_t start = (data->scope_pos + LIBKSS_SCOPE_WINDOW - count) & (LIBKSS_SCOPE_WINDOW - 1);
+    for (uint32_t i = 0; i < count; i++) {
+        out[i] = ring[(start + i) & (LIBKSS_SCOPE_WINDOW - 1)];
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t libkss_plugin_get_vu(void* user_data, float* out, uint32_t cap) {
+    LibkssReplayerData* data = (LibkssReplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return 0;
+    }
+
+    // The host checks this against the declared channel count on every captured
+    // frame, so the count is reported even with the capture switched off.
+    uint32_t count = data->scope_count < cap ? data->scope_count : cap;
+    for (uint32_t c = 0; c < count; c++) {
+        if (!data->scope_enabled) {
+            out[c] = 0.0f;
+            continue;
+        }
+        const float* ring = &data->scope_ring[c * LIBKSS_SCOPE_WINDOW];
+        uint32_t start = (data->scope_pos + LIBKSS_SCOPE_WINDOW - LIBKSS_VU_WINDOW) & (LIBKSS_SCOPE_WINDOW - 1);
+        float peak = 0.0f;
+        for (uint32_t i = 0; i < LIBKSS_VU_WINDOW; i++) {
+            float v = ring[(start + i) & (LIBKSS_SCOPE_WINDOW - 1)];
+            if (v < 0.0f) {
+                v = -v;
+            }
+            if (v > peak) {
+                peak = v;
+            }
+        }
+        out[c] = peak;
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static RVPlaybackPlugin g_libkss_plugin = {
     RV_PLAYBACK_PLUGIN_API_VERSION,
@@ -386,17 +606,17 @@ static RVPlaybackPlugin g_libkss_plugin = {
     nullptr, // settings_updated
     nullptr, // static_destroy
 
-    // Visualization: none (caps = 0; pure decoder, no pattern grid or scope).
-    nullptr, // get_structure
+    // Visualization: per-chip-channel scope and VU straight from the emulation.
+    libkss_plugin_get_structure,
     nullptr, // get_columns
     nullptr, // get_pattern_channels
-    nullptr, // get_scope_channels
+    libkss_plugin_get_scope_channels,
     nullptr, // get_position
     nullptr, // get_channel_rows
     nullptr, // get_cells
-    nullptr, // set_scope_enabled
-    nullptr, // get_scope_samples
-    nullptr, // get_vu
+    libkss_plugin_set_scope_enabled,
+    libkss_plugin_get_scope_samples,
+    libkss_plugin_get_vu,
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
