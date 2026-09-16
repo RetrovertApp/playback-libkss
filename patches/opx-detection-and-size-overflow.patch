@@ -1,0 +1,41 @@
+Tighten OPX detection and stop KSS_opx2kss overflowing its buffer.
+
+KSS_isOPXdata matched the trailing SUB byte alone, claiming any file with 0x1A
+at 0x7D -- in a SID that byte is the high half of the load address.
+
+KSS_opx2kss then sized its buffer in a uint16_t, so 0x8000 + size - 0x100
+wrapped: a 36221-byte input allocated 3229 bytes and memcpy'd ~52 KB into it.
+
+--- a/src/kss/opx2kss.c
++++ b/src/kss/opx2kss.c
+@@ -44,7 +44,7 @@
+ };
+
+ int KSS_isOPXdata(uint8_t *data, uint32_t size) {
+-  if ((128 + 32 < size) && /*data[0x7B]==0x0D&&data[0x7C]==0x0A&&*/ data[0x7D] == 0x1A)
++  if ((128 + 32 < size) && data[0x7B] == 0x0D && data[0x7C] == 0x0A && data[0x7D] == 0x1A)
+     return 1;
+   else
+     return 0;
+@@ -131,14 +131,18 @@
+ #define OFFSET(b, l, x) (b + KSS_HEADER_SIZE + x - l)
+
+ KSS *KSS_opx2kss(uint8_t *data, uint32_t size) {
+   KSS *kss;
+   int i;
+
+   uint8_t *buf;
+-  uint16_t load_adr = 0x0100, load_size = 0x8000 + size - load_adr;
++  uint16_t load_adr = 0x0100;
+   uint16_t init_adr = 0x0106, play_adr = 0x0103;
++  uint32_t wide_size = 0x8000u + size - load_adr;
++  uint16_t load_size;
+
+-  if (size < 16 || opxdrv_size == 0)
++  /* The KSS header carries load_size as 16 bits, so oversized input is refused. */
++  if (size < 16 || wide_size > 0xFFFFu || opxdrv_size == 0)
+     return NULL;
++  load_size = (uint16_t)wide_size;
+
+   if ((buf = malloc(load_size + KSS_HEADER_SIZE)) == NULL)
+     return NULL;

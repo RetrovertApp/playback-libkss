@@ -305,8 +305,10 @@ static RVProbeResult libkss_plugin_probe_can_play(uint8_t* probe_data, uint64_t 
         return RVProbeResult_Supported;
     }
 
-    // OPX format: check byte at 0x7D == 0x1A (requires > 160 bytes)
-    if (data_size > 160 && probe_data[0x7D] == 0x1A) {
+    // OPX format: CR LF SUB marker at 0x7B (requires > 160 bytes). The SUB byte alone
+    // also matches any SID tune loading at $1Axx.
+    if (data_size > 160 && probe_data[0x7B] == 0x0D && probe_data[0x7C] == 0x0A
+        && probe_data[0x7D] == 0x1A) {
         return RVProbeResult_Supported;
     }
 

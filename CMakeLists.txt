@@ -21,6 +21,7 @@ download_library(
     HASH "303a0948350a137630a69658d658e9c11b42832588768b9f60c19b8586348c76"
     EXTRACT_DIR "libkss-1.2.1"
     PATCHES patches/kssplay-channel-mask-type.patch
+            patches/opx-detection-and-size-overflow.patch
 )
 
 # Download submodules (chip emulators + KSS drivers)
